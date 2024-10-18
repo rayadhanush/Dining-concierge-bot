@@ -1,6 +1,5 @@
 import {
   SQSClient,
-  SendMessageCommand,
   ReceiveMessageCommand,
   DeleteMessageCommand,
 } from "@aws-sdk/client-sqs";
@@ -18,13 +17,26 @@ const dynamodb = DynamoDBDocumentClient.from(client);
 
 const ses = new SESClient({});
 
-const tableName = "yelp-restaurants";
+const TABLE_NAME = "yelp-restaurants";
 const INDEX = "restaurants";
 const REGION = "us-east-1";
+const NUMBER_OF_RESTAURANTS = 3; // Number of restaurants to suggest to user
 
 const SQS_QUEUE_URL = process.env.SQS_QUEUE_URL;
 const ES_ENDPOINT = process.env.ES_ENDPOINT; // AWS Opensearch domain url
 const SOURCE_EMAIL = process.env.SOURCE_EMAIL; // email address from which you want to send suggestions
+
+// Helper function
+const formatDate = (dateString) => {
+  const options = {
+    weekday: "long",
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+  };
+  const date = new Date(dateString);
+  return date.toLocaleDateString("en-US", options);
+};
 
 // Poll messages from SQS
 const pollSQS = async () => {
@@ -44,10 +56,10 @@ const pollSQS = async () => {
   }
 };
 
-// Query OpenSearch for 3 random restaurants matching cuisine requested by user
+// Query OpenSearch for N random restaurants matching cuisine requested by user
 const queryOS = async (client, cuisine) => {
   const query = {
-    size: 3,
+    size: NUMBER_OF_RESTAURANTS,
     query: {
       function_score: {
         query: {
@@ -59,9 +71,7 @@ const queryOS = async (client, cuisine) => {
         },
         functions: [
           {
-            random_score: {
-              seed: "4",
-            },
+            random_score: {},
           },
         ],
       },
@@ -92,13 +102,18 @@ const handleOSResponse = async (response, attributes) => {
     console.error("No hits retrieved from Opensearch");
     await sendError(attributes);
   } else {
-    const topHit = hitsObj.hits[0];
-    const topId = topHit._id;
+    const suggestions = [];
 
-    const suggestion = await queryDynamoDB(topId);
+    for (const hit of hitsObj.hits) {
+      const restaurantId = hit._id;
+      const suggestion = await queryDynamoDB(restaurantId);
+      if (suggestion) {
+        suggestions.push(suggestion);
+      }
+    }
 
-    if (suggestion) {
-      await sendMessage(suggestion, attributes);
+    if (suggestions.length > 0) {
+      await sendMessage(suggestions, attributes);
     } else {
       await sendError(attributes);
     }
@@ -108,7 +123,7 @@ const handleOSResponse = async (response, attributes) => {
 // Query DynamoDB using restaurant ID from OpenSearch
 const queryDynamoDB = async (restaurantId) => {
   const params = {
-    TableName: tableName,
+    TableName: TABLE_NAME,
     Key: { id: restaurantId },
   };
 
@@ -124,21 +139,27 @@ const queryDynamoDB = async (restaurantId) => {
   }
 };
 
-// Send email with restaurant suggestion
-const sendMessage = async (restaurant, attributes) => {
+// Send email with restaurant suggestions
+const sendMessage = async (restaurants, attributes) => {
   // Get attribute details
-  const date = new Date(attributes.Date.StringValue).toDateString();
+  const date = formatDate(attributes.Date.StringValue);
   const email = attributes.Email.StringValue;
   const count = attributes.NoOfPeople.StringValue;
   const time = attributes.Time.StringValue;
 
-  // Get restaurant details
-  const restName = restaurant.Name;
-  const cuisine = restaurant.Cuisine;
-  const location = restaurant.Address;
+  // Construct message for multiple restaurants
+  let message = `Hello! Here are my restaurant suggestions for ${count} people on ${date} at ${time}:\n\n`;
 
-  // Draft message
-  const message = `Hello! Here are my ${cuisine} restaurant suggestions for ${count} people on ${date} at ${time}: ${restName}, located at ${location}. Enjoy!`;
+  restaurants.forEach((restaurant, index) => {
+    const restName = restaurant.Name;
+    const cuisine = restaurant.Cuisine;
+    const location = restaurant.Address;
+    message += `${
+      index + 1
+    }. ${restName} (${cuisine}), located at ${location}\n`;
+  });
+
+  message += "\nEnjoy your dining experience!";
 
   const params = {
     Destination: { ToAddresses: [email] },
@@ -163,11 +184,12 @@ const sendMessage = async (restaurant, attributes) => {
 // Send error message via SES
 const sendError = async (attributes) => {
   // Get attribute details
-  const date = new Date(attributes.Date.StringValue).toDateString();
+  const date = formatDate(attributes.Date.StringValue);
   const email = attributes.Email.StringValue;
   const count = attributes.NoOfPeople.StringValue;
   const time = attributes.Time.StringValue;
   const cuisine = attributes.CuisineType.StringValue;
+  const location = attributes.Location.StringValue;
 
   // Draft message
   const message = `Unfortunately, no ${cuisine} restaurants found in ${location} for ${count} people on ${date} at ${time}. Please try again later.`;
